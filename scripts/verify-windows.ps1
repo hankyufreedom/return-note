@@ -199,7 +199,7 @@ try {
  Assert ($count -gt 0) 'marketing sidebar shows existing weekly writing tasks'
  InputText 110 '跟進安排';Click 111
  $s=State;Assert ($s.notes[-1].category -eq '行銷／GTM') 'capture inside a category keeps the explicit category'
- Command 923
+ Command 1203
  $s=State;Assert ($s.notes[-1].category -eq '外部案子') 'manual category change is saved'
  Assert ([RN]::SendMessage($list,0x018B,[IntPtr]::Zero,[IntPtr]::Zero).ToInt32() -eq $count) 'moving a task updates the current filter immediately'
  Click 304
@@ -226,9 +226,9 @@ try {
  [RN]::PostMessage($script:window,0x001F,[IntPtr]::Zero,[IntPtr]::Zero)|Out-Null;Start-Sleep -Milliseconds 100
  if([RN]::IsWindow($menu)){[RN]::PostMessage($menu,0x0100,[IntPtr]27,[IntPtr]::Zero)|Out-Null;Start-Sleep -Milliseconds 100}
  Assert (-not [RN]::IsWindow($menu)) 'category chooser dismisses safely'
- Command 921
+ Command 1201
  $s=State;Assert ($s.notes[-1].category -eq '行銷／GTM') 'row tag targets the clicked note for category changes'
- Command 922
+ Command 1202
  Screenshot 'categories.png'
  Command 116;Assert ([RN]::IsWindowVisible((ControlHandle 142))) 'note editor exposes a category button';Screenshot 'category-detail.png';Click 116
  # Collapsing reclaims the full sidebar width, preserves the filter, and survives restart.

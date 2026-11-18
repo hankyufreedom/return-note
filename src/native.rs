@@ -5,7 +5,7 @@ use crate::{
 };
 use return_note::{
     ai::Classification,
-    model::{Board, CATEGORIES, CATEGORY_LABELS, Status, category_index, now},
+    model::{Board, MAX_TAGS, Status, now},
     storage::Storage,
 };
 use std::{
@@ -88,6 +88,7 @@ struct Visual {
     bold: HFONT,
     tiny: HFONT,
     scale: f64,
+    managing: bool,
     settings: bool,
     editing: bool,
     searching: bool,
@@ -97,7 +98,8 @@ struct Visual {
     drag_source: Option<u64>,
     drag_indicator: Option<i32>,
     category_filter: Option<usize>,
-    category_counts: [usize; 6],
+    labels: Vec<String>,
+    category_counts: Vec<usize>,
     selected_category: usize,
     rows: Vec<DisplayRow>,
     toast: String,
@@ -127,14 +129,18 @@ impl Visual {
         };
         p.fill(0, 0, w, h, PAPER);
         let left = if self.sidebar_collapsed { 14 } else { 110 };
-        let title = if self.settings {
+        let title = if self.managing {
+            "管理標籤"
+        } else if self.settings {
             "設定"
         } else if self.editing {
             "便條"
         } else if self.filter == 4 {
             "已完成"
-        } else if self.sidebar_collapsed && self.category_filter.is_some() {
-            CATEGORY_LABELS[self.category_filter.unwrap()]
+        } else if self.sidebar_collapsed
+            && let Some(i) = self.category_filter
+        {
+            &self.labels[i]
         } else {
             "回來"
         };
@@ -173,7 +179,9 @@ impl Visual {
             );
         }
         p.stroke(&[(22, 48), (w - 22, 48)], LINE, 1);
-        if self.settings {
+        if self.managing {
+            p.round(24, 186, w - 48, 38, 7, INPUT);
+        } else if self.settings {
             p.round(24, 104, w - 48, 40, 8, INPUT);
             p.round(24, 182, w - 48, 40, 8, INPUT);
         } else if self.editing {
@@ -252,7 +260,10 @@ impl Visual {
             let hover = !GetPropW(d.hwndItem, wide("rn.hover").as_ptr()).is_null();
             let focus = d.itemState & ODS_FOCUS != 0;
             let pressed = d.itemState & ODS_SELECTED != 0;
-            if (300..=305).contains(&id) {
+            if (300..=332).contains(&id) {
+                if (id - 300) as usize >= self.category_counts.len() {
+                    return;
+                }
                 let category = (id > 300).then_some((id - 301) as usize);
                 let active = self.category_filter == category;
                 let (ink, tint) = category.map(category_colors).unwrap_or((INK, INPUT));
@@ -264,7 +275,7 @@ impl Visual {
                 }
                 p.text(
                     if let Some(index) = category {
-                        CATEGORY_LABELS[index]
+                        &self.labels[index]
                     } else {
                         "全部"
                     },
@@ -292,7 +303,7 @@ impl Visual {
                 let (ink, tint) = category_colors(self.selected_category);
                 p.round(x, y, w, h, 6, tint);
                 p.text(
-                    &format!("{}  ▾", CATEGORY_LABELS[self.selected_category]),
+                    &format!("{}  ▾", self.labels[self.selected_category]),
                     self.tiny,
                     ink,
                     x + 8,
@@ -382,7 +393,7 @@ impl Visual {
         let (category_ink, category_tint) = category_colors(n.category);
         p.round(x + w - 74, y + 8, 70, 20, 5, category_tint);
         p.text(
-            CATEGORY_LABELS[n.category],
+            &self.labels[n.category],
             self.tiny,
             category_ink,
             x + w - 72,
@@ -461,6 +472,7 @@ struct App {
     storage: Storage,
     selected: Option<u64>,
     rows: Vec<u64>,
+    managing: bool,
     settings: bool,
     dirty: bool,
     filter: usize,
@@ -540,9 +552,18 @@ impl App {
             self.control(id, "BUTTON", label, WS_TABSTOP);
         }
         self.control(300, "BUTTON", "全部分類", WS_TABSTOP);
-        for (index, category) in CATEGORY_LABELS.iter().enumerate() {
-            self.control(301 + index as i32, "BUTTON", category, WS_TABSTOP);
+        for index in 0..MAX_TAGS {
+            self.control(301 + index as i32, "BUTTON", "", WS_TABSTOP);
         }
+        self.control(333, "COMBOBOX", "", WS_TABSTOP | CBS_DROPDOWNLIST as u32);
+        self.control(220, "COMBOBOX", "", WS_TABSTOP | CBS_DROPDOWNLIST as u32);
+        self.control(221, "EDIT", "", WS_TABSTOP | ES_AUTOHSCROLL as u32);
+        for (id, label) in [(222, "新增"), (223, "改名"), (224, "刪除標籤")] {
+            self.control(id, "BUTTON", label, WS_TABSTOP);
+        }
+        self.control(225, "STATIC", "標籤", 0);
+        self.control(226, "STATIC", "名稱", 0);
+
         self.control(114, "COMBOBOX", "", CBS_DROPDOWNLIST as u32);
         for name in ["全部未完成", "現在做", "等結果", "稍後", "已完成"] {
             SendMessageW(self.h(114), CB_ADDSTRING, 0, wide(name).as_ptr() as isize);
@@ -574,9 +595,7 @@ impl App {
         SendMessageW(self.h(131), EM_SETLIMITTEXT, 200, 0);
         SendMessageW(self.h(131), WM_SETFONT, self.big as usize, 1);
         self.control(132, "COMBOBOX", "", CBS_DROPDOWNLIST as u32);
-        for c in CATEGORIES {
-            SendMessageW(self.h(132), CB_ADDSTRING, 0, wide(c).as_ptr() as isize);
-        }
+        self.sync_tags();
         self.control(
             134,
             "EDIT",
@@ -685,6 +704,7 @@ impl App {
             bold: self.bold,
             tiny: self.tiny,
             scale: self.scale,
+            managing: self.managing,
             settings: self.settings,
             editing: self.editing,
             searching: self.searching,
@@ -698,12 +718,19 @@ impl App {
                 .map(|drag| drag.source),
             drag_indicator: self.drag.as_ref().and_then(|drag| drag.indicator),
             category_filter: self.category_filter,
+            labels: self
+                .board
+                .settings
+                .tags
+                .iter()
+                .map(|t| t.label.clone())
+                .collect(),
             category_counts: self.category_counts(),
             selected_category: self
                 .selected
                 .and_then(|id| self.board.notes.iter().find(|n| n.id == id))
-                .map(|n| category_index(&n.category))
-                .unwrap_or(4),
+                .map(|n| self.board.index(&n.category))
+                .unwrap_or(0),
             rows: self
                 .rows
                 .iter()
@@ -713,7 +740,7 @@ impl App {
                     title: n.title.clone(),
                     subtitle: Self::subtitle(n),
                     timing: n.timer_started.is_some(),
-                    category: category_index(&n.category),
+                    category: self.board.index(&n.category),
                     status: n.status,
                     reminder_due: n.reminder_due,
                 })
@@ -759,7 +786,18 @@ impl App {
         let inner = w - 48;
         let mut shown = vec![117];
         self.pos(117, w - 40, 10, 28, 28);
-        if self.settings {
+        if self.managing {
+            shown.extend([210, 220, 221, 222, 223, 224, 225, 226, 211]);
+            self.pos(210, 16, 14, 28, 28);
+            self.pos(225, 24, 71, inner, 22);
+            self.pos(220, 24, 100, inner, 220);
+            self.pos(226, 24, 156, inner, 22);
+            self.pos(221, 34, 194, inner - 20, 24);
+            for (i, id) in [222, 223, 224].iter().enumerate() {
+                self.pos(*id, 24 + i as i32 * (inner / 3), 250, inner / 3 - 4, 36);
+            }
+            self.pos(211, 24, 315, inner, 90);
+        } else if self.settings {
             shown.extend([
                 210, 202, 203, 204, 205, 206, 207, 208, 209, 214, 211, 213, 215,
             ]);
@@ -798,8 +836,20 @@ impl App {
                 },
             );
             if !self.board.settings.sidebar_collapsed {
-                let category_pitch = ((h - 132) / 6).clamp(22, 30);
-                for index in 0..6 {
+                let count = self.board.settings.tags.len() as i32 + 1;
+                let overflow = count * 22 > h - 132;
+                if overflow {
+                    shown.push(333);
+                    self.pos(333, 8, 56, 92, 220);
+                    SendMessageW(
+                        self.h(333),
+                        CB_SETCURSEL,
+                        self.category_filter.map_or(0, |i| i + 1),
+                        0,
+                    );
+                }
+                let category_pitch = ((h - 132) / count).clamp(22, 30);
+                for index in 0..if overflow { 0 } else { count } {
                     shown.push(300 + index);
                     self.pos(
                         300 + index,
@@ -895,9 +945,11 @@ impl App {
                 id,
                 text(self.h(131)),
                 text(self.h(134)),
-                CATEGORIES
+                self.board
+                    .settings
+                    .tags
                     .get(category as usize)
-                    .unwrap_or(&"其他")
+                    .map_or("其他", |t| t.key.as_str())
                     .to_string(),
             )?;
         }
@@ -987,19 +1039,14 @@ impl App {
         if let Some(n) = id.and_then(|id| self.board.notes.iter().find(|n| n.id == id)) {
             set(self.h(131), &n.title);
             set(self.h(134), &n.resume);
-            SendMessageW(
-                self.h(132),
-                CB_SETCURSEL,
-                CATEGORIES
-                    .iter()
-                    .position(|c| *c == n.category)
-                    .unwrap_or(4),
-                0,
-            );
+            SendMessageW(self.h(132), CB_SETCURSEL, self.board.index(&n.category), 0);
             set(self.h(130), n.status.label());
             set(
                 self.h(142),
-                &format!("分類：{}", CATEGORY_LABELS[category_index(&n.category)]),
+                &format!(
+                    "分類：{}",
+                    self.board.settings.tags[self.board.index(&n.category)].label
+                ),
             );
             set(
                 self.h(138),
@@ -1037,12 +1084,28 @@ impl App {
             SendMessageW(self.h(120), LB_SETCURSEL, index, 0);
         }
     }
-    fn category_counts(&self) -> [usize; 6] {
-        let mut counts = [0; 6];
+    unsafe fn sync_tags(&self) {
+        for id in [132, 220, 333] {
+            SendMessageW(self.h(id), CB_RESETCONTENT, 0, 0);
+            if id == 333 {
+                SendMessageW(self.h(id), CB_ADDSTRING, 0, wide("全部").as_ptr() as isize);
+            }
+            for t in &self.board.settings.tags {
+                SendMessageW(
+                    self.h(id),
+                    CB_ADDSTRING,
+                    0,
+                    wide(&t.label).as_ptr() as isize,
+                );
+            }
+        }
+    }
+    fn category_counts(&self) -> Vec<usize> {
+        let mut counts = vec![0; self.board.settings.tags.len() + 1];
         for n in &self.board.notes {
             if (self.filter == 4) == (n.status == Status::Done) {
                 counts[0] += 1;
-                counts[category_index(&n.category) + 1] += 1;
+                counts[self.board.index(&n.category) + 1] += 1;
             }
         }
         counts
@@ -1065,7 +1128,7 @@ impl App {
             })
             .filter(|n| {
                 self.category_filter
-                    .is_none_or(|index| n.category == CATEGORIES[index])
+                    .is_none_or(|index| n.category == self.board.settings.tags[index].key)
             })
             .filter(|n| {
                 search.is_empty()
@@ -1075,7 +1138,7 @@ impl App {
                         n.original,
                         n.resume,
                         n.category,
-                        CATEGORY_LABELS[category_index(&n.category)]
+                        self.board.settings.tags[self.board.index(&n.category)].label
                     )
                     .to_lowercase()
                     .contains(&search)
@@ -1094,7 +1157,14 @@ impl App {
         self.publish_view();
         let counts = self.category_counts();
         set(self.h(300), &format!("全部分類，共 {} 筆", counts[0]));
-        for (index, category) in CATEGORY_LABELS.iter().enumerate() {
+        for (index, category) in self
+            .board
+            .settings
+            .tags
+            .iter()
+            .map(|t| &t.label)
+            .enumerate()
+        {
             set(
                 self.h(301 + index as i32),
                 &format!("{}，{} 筆", category, counts[index + 1]),
@@ -1107,7 +1177,7 @@ impl App {
             let label = format!(
                 "{} · {} · {}",
                 n.status.label(),
-                CATEGORY_LABELS[category_index(&n.category)],
+                self.board.settings.tags[self.board.index(&n.category)].label,
                 n.title
             );
             SendMessageW(self.h(120), LB_ADDSTRING, 0, wide(&label).as_ptr() as isize);
@@ -1119,7 +1189,7 @@ impl App {
         SendMessageW(self.h(120), WM_SETREDRAW, 1, 0);
         InvalidateRect(self.h(120), null(), 0);
         self.layout();
-        for id in 300..=305 {
+        for id in 300..=332 {
             InvalidateRect(self.h(id), null(), 0);
         }
     }
@@ -1373,7 +1443,7 @@ impl App {
         let id = next.capture(&raw)?;
         let fixed_category = self
             .category_filter
-            .map(|index| CATEGORIES[index].to_string());
+            .map(|index| self.board.settings.tags[index].key.clone());
         if let Some(category) = &fixed_category {
             let note = next.notes.last_mut().unwrap();
             note.category.clone_from(category);
@@ -1449,14 +1519,20 @@ impl App {
         } else {
             self.notice("已加入清單，正在分類…");
         }
+        let tags = self.board.settings.tags.clone();
         std::thread::spawn(move || {
-            let result =
-                network::classify(&job.original, &model, &key).map(|mut classification| {
+            let labels = tags.iter().map(|t| t.label.clone()).collect::<Vec<_>>();
+            let result = network::classify(&job.original, &model, &key, &labels).map(
+                |mut classification| {
+                    if let Some(t) = tags.iter().find(|t| t.label == classification.category) {
+                        classification.category = t.key.clone();
+                    }
                     if let Some(category) = job.fixed_category {
                         classification.category = category;
                     }
                     classification
-                });
+                },
+            );
             let _ = tx.send(Outcome {
                 id: job.id,
                 revision: job.revision,
@@ -1508,7 +1584,7 @@ impl App {
                         }
                         self.notice(&format!(
                             "已分到{}",
-                            CATEGORY_LABELS[category_index(&category)]
+                            self.board.settings.tags[self.board.index(&category)].label
                         ));
                     } else {
                         self.notice("已保留你的修改");
@@ -1552,6 +1628,7 @@ impl App {
     unsafe fn settings(&mut self, show: bool) -> Result<(), String> {
         self.save_edits()?;
         self.remember_main_size();
+        self.managing = false;
         self.settings = show;
         self.editing = false;
         self.toast.clear();
@@ -1613,7 +1690,7 @@ impl App {
             return Ok(());
         };
         let menu = CreatePopupMenu();
-        for (index, category) in CATEGORIES.iter().enumerate() {
+        for (index, category) in self.board.settings.tags.iter().map(|t| &t.key).enumerate() {
             AppendMenuW(
                 menu,
                 MF_STRING
@@ -1622,8 +1699,8 @@ impl App {
                     } else {
                         0
                     },
-                920 + index,
-                wide(CATEGORY_LABELS[index]).as_ptr(),
+                1200 + index,
+                wide(&self.board.settings.tags[index].label).as_ptr(),
             );
         }
         let mut point: POINT = std::mem::zeroed();
@@ -1661,8 +1738,15 @@ impl App {
             add(140, "看原文");
             add(141, "重新分類");
             AppendMenuW(menu, MF_SEPARATOR, 0, null());
-            for (i, label) in CATEGORY_LABELS.iter().enumerate() {
-                add(920 + i, &format!("分類：{label}"));
+            for (i, label) in self
+                .board
+                .settings
+                .tags
+                .iter()
+                .map(|t| &t.label)
+                .enumerate()
+            {
+                add(1200 + i, &format!("分類：{label}"));
             }
         } else {
             add(904, "搜尋便條\tCtrl+F");
@@ -1690,6 +1774,7 @@ impl App {
                 sizes as usize,
                 wide("字體與便條大小").as_ptr(),
             );
+            add(906, "管理標籤");
             add(900, "設定");
             add(212, "結束程式");
         }
@@ -1737,6 +1822,20 @@ impl App {
             self.dirty = true;
             InvalidateRect(self.h(110), null(), 0);
             SetTimer(self.hwnd, 2, 450, None);
+            return Ok(());
+        }
+        if id == 333 && event == CBN_SELCHANGE {
+            let ix = SendMessageW(self.h(333), CB_GETCURSEL, 0, 0);
+            if ix >= 0 {
+                self.action(300 + ix as i32, BN_CLICKED)?;
+            }
+            return Ok(());
+        }
+        if id == 220 && event == CBN_SELCHANGE {
+            let ix = SendMessageW(self.h(220), CB_GETCURSEL, 0, 0) as usize;
+            if let Some(t) = self.board.settings.tags.get(ix) {
+                set(self.h(221), &t.label);
+            }
             return Ok(());
         }
         if id == 132 && event == CBN_SELCHANGE {
@@ -1807,7 +1906,7 @@ impl App {
             }
             940 | 941 => self.move_selected(id == 941)?,
             142 | 930 => self.category_menu()?,
-            300..=305 => {
+            300..=332 => {
                 self.save_edits()?;
                 self.category_filter = (id > 300).then_some((id - 301) as usize);
                 self.refresh();
@@ -1817,6 +1916,54 @@ impl App {
             117 => {
                 self.save_edits()?;
                 ShowWindow(self.hwnd, SW_MINIMIZE);
+            }
+            906 => {
+                self.settings(true)?;
+                self.managing = true;
+                self.layout();
+                SendMessageW(self.h(220), CB_SETCURSEL, 0, 0);
+                set(self.h(221), "");
+                set(
+                    self.h(211),
+                    "輸入名稱可新增標籤。選取既有標籤可改名或刪除。",
+                );
+                SetFocus(self.h(221));
+            }
+            222..=224 if self.managing => {
+                let ix = SendMessageW(self.h(220), CB_GETCURSEL, 0, 0) as usize;
+                let name = text(self.h(221));
+                let mut next = self.board.clone();
+                next.change_tag(
+                    (id != 222).then_some(ix),
+                    (id != 224).then_some(name.as_str()),
+                )?;
+                if id == 224
+                    && MessageBoxW(
+                        self.hwnd,
+                        wide("刪除這個標籤？使用它的便條會移到「其他」。").as_ptr(),
+                        wide("刪除標籤").as_ptr(),
+                        MB_YESNO | MB_DEFBUTTON2,
+                    ) != IDYES
+                {
+                    return Ok(());
+                }
+                let filter = self
+                    .category_filter
+                    .map(|i| self.board.settings.tags[i].key.clone());
+                self.commit(next)?;
+                self.category_filter = filter
+                    .and_then(|key| self.board.settings.tags.iter().position(|t| t.key == key));
+                self.sync_tags();
+                self.refresh();
+                self.select(self.rows.first().copied());
+                let i = if id == 222 {
+                    self.board.settings.tags.len() - 2
+                } else {
+                    ix.min(self.board.settings.tags.len() - 1)
+                };
+                SendMessageW(self.h(220), CB_SETCURSEL, i, 0);
+                set(self.h(221), &self.board.settings.tags[i].label);
+                set(self.h(211), "標籤已儲存。");
             }
             900 => self.settings(true)?,
             904 => {
@@ -1842,14 +1989,14 @@ impl App {
                 self.refresh();
                 self.select(self.rows.first().copied());
             }
-            920..=924 => {
-                SendMessageW(self.h(132), CB_SETCURSEL, (id - 920) as usize, 0);
+            1200..=1231 => {
+                SendMessageW(self.h(132), CB_SETCURSEL, (id - 1200) as usize, 0);
                 self.dirty = true;
                 self.save_edits()?;
-                let category = CATEGORIES[(id - 920) as usize];
+                let category = self.board.settings.tags[(id - 1200) as usize].key.clone();
                 if self
                     .category_filter
-                    .is_some_and(|index| CATEGORIES[index] != category)
+                    .is_some_and(|index| self.board.settings.tags[index].key != category)
                     && !self.editing
                 {
                     self.select(self.rows.first().copied());
@@ -1858,7 +2005,7 @@ impl App {
                 }
                 self.notice(&format!(
                     "已移至{}",
-                    CATEGORY_LABELS[category_index(category)]
+                    self.board.settings.tags[self.board.index(&category)].label
                 ));
             }
             116 => self.compact(self.editing)?,
@@ -2368,7 +2515,7 @@ unsafe extern "system" fn control_proc(
             111, 112, 113, 116, 117, 118, 119, 138, 142, 206, 207, 208, 209, 210, 214, 215,
         ]
         .contains(&id)
-            || (300..=305).contains(&id))
+            || (300..=332).contains(&id))
         && GetPropW(hwnd, wide("rn.hover").as_ptr()).is_null()
     {
         SetPropW(hwnd, wide("rn.hover").as_ptr(), 1usize as _);
@@ -2912,6 +3059,7 @@ pub fn run() {
             storage,
             selected: None,
             rows: vec![],
+            managing: false,
             settings: false,
             dirty: false,
             filter: 0,

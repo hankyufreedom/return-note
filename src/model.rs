@@ -3,10 +3,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const CATEGORIES: [&str; 5] = ["產品／開發", "行銷／GTM", "營運", "外部案子", "其他"];
 pub const CATEGORY_LABELS: [&str; 5] = ["產品開發", "行銷 GTM", "營運", "外部案子", "其他"];
-pub fn category_index(category: &str) -> usize {
-    CATEGORIES.iter().position(|c| *c == category).unwrap_or(4)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Tag {
+    pub key: String,
+    pub label: String,
+}
+fn default_tags() -> Vec<Tag> {
+    CATEGORIES
+        .iter()
+        .zip(CATEGORY_LABELS)
+        .map(|(key, label)| Tag {
+            key: key.to_string(),
+            label: label.into(),
+        })
+        .collect()
 }
 pub const MAX_TEXT: usize = 8000;
+pub const MAX_TAGS: usize = 32;
 pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -82,6 +95,8 @@ impl Note {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub tags: Vec<Tag>,
+    pub next_tag: u64,
     pub zoom_percent: u16,
     pub topmost: bool,
     pub compact: bool,
@@ -96,6 +111,8 @@ fn is_false(value: &bool) -> bool {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            tags: default_tags(),
+            next_tag: 1,
             zoom_percent: 100,
             topmost: true,
             compact: true,
@@ -130,16 +147,92 @@ impl Default for Board {
 }
 
 impl Board {
+    pub fn index(&self, key: &str) -> usize {
+        self.settings
+            .tags
+            .iter()
+            .position(|t| t.key == key)
+            .unwrap_or(self.settings.tags.len().saturating_sub(1))
+    }
+    fn has_tag(&self, key: &str) -> bool {
+        self.settings.tags.iter().any(|t| t.key == key)
+    }
+    pub fn change_tag(&mut self, index: Option<usize>, name: Option<&str>) -> Result<(), String> {
+        let tags = &mut self.settings.tags;
+        if let Some(i) = index
+            && (i >= tags.len() || tags[i].key == "其他")
+        {
+            return Err("「其他」保留給未分類的便條。".into());
+        }
+        if let Some(raw) = name {
+            let name = raw.trim();
+            if name.is_empty() || name.chars().count() > 24 || name.chars().any(char::is_control) {
+                return Err("標籤名稱請填 1 到 24 字。".into());
+            }
+            if name == "全部"
+                || tags
+                    .iter()
+                    .enumerate()
+                    .any(|(i, t)| Some(i) != index && t.label.to_lowercase() == name.to_lowercase())
+            {
+                return Err("這個標籤名稱已經使用。".into());
+            }
+            if let Some(i) = index {
+                tags[i].label = name.into()
+            } else {
+                if tags.len() >= MAX_TAGS {
+                    return Err("最多可設 32 個標籤。".into());
+                }
+                let key = format!("tag-{}", self.settings.next_tag);
+                self.settings.next_tag = self
+                    .settings
+                    .next_tag
+                    .checked_add(1)
+                    .ok_or("標籤編號已達上限。")?;
+                tags.insert(
+                    tags.len() - 1,
+                    Tag {
+                        key,
+                        label: name.into(),
+                    },
+                );
+            }
+        } else if let Some(i) = index {
+            let key = tags.remove(i).key;
+            for n in &mut self.notes {
+                if n.category == key {
+                    n.category = "其他".into();
+                    n.revision += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.version != 2 {
             return Err("這份資料來自較新的版本，請先更新程式。".into());
+        }
+        let tags = &self.settings.tags;
+        if tags.is_empty()
+            || tags.len() > MAX_TAGS
+            || tags.last().is_none_or(|t| t.key != "其他")
+            || tags.iter().any(|t| t.label.trim().is_empty())
+            || tags
+                .iter()
+                .map(|t| &t.key)
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                != tags.len()
+        {
+            return Err("標籤資料格式不完整。".into());
         }
         let mut ids = std::collections::HashSet::new();
         if self.notes.iter().any(|n| {
             n.id >= self.next_id
                 || !ids.insert(n.id)
                 || n.title.trim().is_empty()
-                || !CATEGORIES.contains(&n.category.as_str())
+                || !self.has_tag(&n.category)
         }) || self
             .notes
             .iter()
@@ -170,7 +263,7 @@ impl Board {
         let categories: std::collections::HashMap<_, _> = self
             .notes
             .iter()
-            .map(|note| (note.id, category_index(&note.category)))
+            .map(|note| (note.id, self.index(&note.category)))
             .collect();
         let mut sorted = visible.to_vec();
         if sorted.iter().any(|id| !categories.contains_key(id)) {
@@ -292,7 +385,23 @@ impl Board {
                 .chars()
                 .take(100)
                 .collect(),
-            category: local_category(text).into(),
+            category: self
+                .settings
+                .tags
+                .iter()
+                .filter(|t| {
+                    t.key != "其他" && text.to_lowercase().contains(&t.label.to_lowercase())
+                })
+                .max_by_key(|t| t.label.len())
+                .map(|t| t.key.clone())
+                .unwrap_or_else(|| {
+                    let key = local_category(text);
+                    if self.has_tag(key) {
+                        key.into()
+                    } else {
+                        "其他".into()
+                    }
+                }),
             status: Status::Inbox,
             resume: String::new(),
             created: now(),
@@ -341,7 +450,7 @@ impl Board {
         if title.trim().is_empty() || title.chars().count() > 200 {
             return Err("便條標題請填 1 到 200 字。".into());
         }
-        if resume.chars().count() > MAX_TEXT || !CATEGORIES.contains(&category.as_str()) {
+        if resume.chars().count() > MAX_TEXT || !self.has_tag(&category) {
             return Err("請檢查回來步驟與分類。".into());
         }
         let n = self
@@ -361,13 +470,15 @@ impl Board {
     // A model can label only the capture it received. It never alters status, timers,
     // other notes, or a note edited while the request was running.
     pub fn apply_ai(&mut self, id: u64, revision: u64, title: String, category: String) -> bool {
+        if !self.has_tag(&category) {
+            return false;
+        }
         if let Some(n) = self
             .notes
             .iter_mut()
             .find(|n| n.id == id && n.revision == revision && n.status != Status::Done)
             && !title.trim().is_empty()
             && title.chars().count() <= 100
-            && CATEGORIES.contains(&category.as_str())
         {
             n.title = title.trim().into();
             n.category = category;
@@ -399,7 +510,10 @@ fn is_startup_application(text: &str) -> bool {
 }
 pub fn local_category(text: &str) -> &'static str {
     let lower = text.to_lowercase();
-    if ["客戶", "委託案", "外部案"].iter().any(|word| lower.contains(word)) {
+    if ["客戶", "委託案", "外部案"]
+        .iter()
+        .any(|word| lower.contains(word))
+    {
         return CATEGORIES[3];
     }
     if is_startup_application(text) {
@@ -580,6 +694,22 @@ mod tests {
         assert!(!b.reorder_visible(&[1, 5, 3], 5, Some(3)).unwrap());
         b.order.push(1);
         assert!(b.validate().is_err());
+    }
+    #[test]
+    fn custom_tag_lifecycle() {
+        let mut b = Board::default();
+        b.change_tag(None, Some("課業")).unwrap();
+        let id = b.capture("課業報告").unwrap();
+        let key = b.notes[0].category.clone();
+        assert_ne!(key, "其他");
+        b.change_tag(Some(b.index(&key)), Some("上課")).unwrap();
+        assert_eq!(b.notes[0].category, key);
+        assert!(b.change_tag(None, Some("上課")).is_err());
+        b.change_tag(Some(b.index(&key)), None).unwrap();
+        assert_eq!(b.notes[0].category, "其他");
+        assert!(!b.apply_ai(id, 0, "舊請求".into(), key));
+        assert!(b.change_tag(Some(b.index("其他")), None).is_err());
+        b.validate().unwrap();
     }
     #[test]
     fn invalid_data_is_rejected() {

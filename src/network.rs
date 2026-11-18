@@ -1,4 +1,6 @@
-use return_note::ai::{Classification, parse_response, request_body, service_error, valid_model};
+use return_note::ai::{
+    Classification, parse_with_labels, request_body, service_error, valid_model,
+};
 use std::{
     ffi::c_void,
     ptr::{null, null_mut},
@@ -86,11 +88,16 @@ impl Drop for Handle {
     }
 }
 
-pub fn classify(text: &str, model: &str, key: &str) -> Result<Classification, String> {
+pub fn classify(
+    text: &str,
+    model: &str,
+    key: &str,
+    labels: &[String],
+) -> Result<Classification, String> {
     if !valid_model(model) {
         return Err("模型名稱無效。".into());
     }
-    let body = serde_json::to_vec(&request_body(text)).map_err(|_| "無法建立分類請求。")?;
+    let body = serde_json::to_vec(&request_body(text, labels)).map_err(|_| "無法建立分類請求。")?;
     unsafe {
         let session = Handle::new(WinHttpOpen(
             wide("ReturnNote/0.3").as_ptr(),
@@ -185,6 +192,6 @@ pub fn classify(text: &str, model: &str, key: &str) -> Result<Classification, St
             return Err(service_error(status, &error));
         }
         let value = serde_json::from_slice(&response).map_err(|_| "AI 回覆格式無法讀取。")?;
-        parse_response(&value)
+        parse_with_labels(&value, labels)
     }
 }
