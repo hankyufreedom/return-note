@@ -1,0 +1,8 @@
+/target/
+/dist/
+/evidence/
+*.tmp
+
+/notes*.json
+/.env
+/.env.*
