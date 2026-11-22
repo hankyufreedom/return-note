@@ -43,6 +43,12 @@ struct Settings: Decodable {
     let topmost, ai_enabled: Bool
     let sidebar_collapsed: Bool?
     let model: String
+    let ai_provider: AIProvider?
+    let openai_enabled: Bool?
+    let openai_model: String?
+    var provider: AIProvider { ai_provider ?? .gemini }
+    var cloudEnabled: Bool { provider == .gemini ? ai_enabled : openai_enabled == true }
+    func modelName(for provider: AIProvider) -> String { provider == .gemini ? model : (openai_model ?? provider.defaultModel) }
 }
 
 struct Board: Decodable {
@@ -104,7 +110,7 @@ final class BoardModel: ObservableObject {
     @Published var clock = timestamp()
     @Published var aiBusy = false
     let core: Core
-    let gemini = Gemini()
+    let ai = AIClient()
     private var draftSave: DispatchWorkItem?
     private var syncingDraft = false
     private var retryReminderAt: UInt64 = 0
@@ -177,7 +183,7 @@ final class BoardModel: ObservableObject {
         category = nil
         completed = false
         query = ""
-        if settings?.ai_enabled == true { classify(id) }
+        if settings?.cloudEnabled == true { classify(id) }
     }
 
     func tick(at: UInt64 = timestamp(), notify: Bool = true) {
@@ -238,42 +244,44 @@ final class BoardModel: ObservableObject {
         }
     }
 
-    func classify(_ id: UInt64? = nil) {
+    func classify(_ id: UInt64? = nil, testing provider: AIProvider? = nil, model: String? = nil, temporaryKey: String? = nil) {
         let token = UUID()
         do {
-            guard let key = try GeminiKey.read() else { throw NoteError("請先在設定儲存 Gemini API key；便條已留在本機。") }
             var fields: [String: Any] = [:]
             if let id { fields["id"] = id }
-            let job = try JSONDecoder().decode(GeminiJobEnvelope.self, from: core.raw("ai_job", fields)).job
-            let task = try gemini.send(job: job, key: key) { [weak self] result in
+            if let provider { fields["provider"] = provider.rawValue }
+            if let model { fields["model"] = model }
+            let job = try JSONDecoder().decode(AIJobEnvelope.self, from: core.raw("ai_job", fields)).job
+            guard let key = try temporaryKey ?? AIKey.read(job.provider) else { throw NoteError("請在設定輸入 \(job.provider.title) API key。") }
+            let task = try ai.send(job: job, key: key) { [weak self] result in
                 DispatchQueue.main.async {
                     guard let self, self.activeAI.contains(where: { $0.0 == token }) else { return }
                     self.activeAI.removeAll { $0.0 == token }
                     self.aiBusy = !self.activeAI.isEmpty
                     do {
                         let (http, response) = try result.get()
-                        if !(200..<300).contains(http) { _ = try self.core.raw("ai_error", ["status": http, "response": response]); return }
+                        if !(200..<300).contains(http) { _ = try self.core.raw("ai_error", ["provider": job.provider.rawValue, "status": http, "response": response]); return }
                         if let id {
                             try self.applyClassification(id, job: job, response: response)
                         } else {
-                            _ = try self.core.raw("ai_check", ["tags": job.tags, "response": response])
-                            self.tell("Gemini 連線成功")
+                            _ = try self.core.raw("ai_check", ["provider": job.provider.rawValue, "tags": job.tags, "response": response])
+                            self.tell("\(job.provider.title) 連線成功")
                         }
                     } catch { self.show(error) }
                 }
             }
             activeAI.append((token, task))
             aiBusy = true
-            tell(id == nil ? "正在測試 Gemini…" : "便條已儲存，正在分類…")
+            tell(id == nil ? "正在測試 \(job.provider.title)…" : "便條已儲存，正在分類…")
         } catch { show(error) }
     }
 
-    private func applyClassification(_ id: UInt64, job: GeminiJob, response: Any) throws {
-        let data = try core.raw("ai_result", ["id": id, "revision": job.revision, "model": job.model, "tags": job.tags, "response": response])
+    private func applyClassification(_ id: UInt64, job: AIJob, response: Any) throws {
+        let data = try core.raw("ai_result", ["id": id, "revision": job.revision, "provider": job.provider.rawValue, "model": job.model, "tags": job.tags, "response": response])
         snapshot = try JSONDecoder().decode(Snapshot.self, from: data)
         struct Applied: Decodable { let applied: Bool }
         let applied = try JSONDecoder().decode(Applied.self, from: data).applied
-        tell(applied ? "已用 Gemini 分類" : "便條或設定已變更，保留本機內容。")
+        tell(applied ? "已用 \(job.provider.title) 分類" : "便條或設定已變更，保留本機內容。")
     }
 
     func cancelAI() {

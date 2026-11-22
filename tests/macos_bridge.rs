@@ -76,6 +76,70 @@ fn stale_ai_response_cannot_overwrite_a_human_edit() {
     assert_eq!(result["board"]["notes"][0]["title"], "用我的標題");
 }
 
+fn openai_response(text: &str) -> Value {
+    json!({"status":"completed","output":[{"type":"reasoning"},{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":text}]}]})
+}
+
+#[test]
+fn openai_provider_round_trip_uses_structured_output_and_keeps_gemini_settings() {
+    let app = Fixture::new();
+    app.call(json!({"action":"preferences","model":"gemini-test","ai_enabled":true}));
+    app.call(
+        json!({"action":"preferences","provider":"openai","model":"gpt-test","ai_enabled":true}),
+    );
+    app.call(json!({"action":"capture","text":"測試登入"}));
+    let job = app.call(json!({"action":"ai_job","id":1}))["job"].clone();
+    assert_eq!(job["provider"], "openai");
+    assert_eq!(job["body"]["model"], "gpt-test");
+    assert_eq!(job["body"]["store"], false);
+    assert_eq!(job["body"]["input"], "測試登入");
+    assert_eq!(job["body"]["text"]["format"]["strict"], true);
+    let settings = app.call(json!({"action":"load"}))["board"]["settings"].clone();
+    assert_eq!(settings["model"], "gemini-test");
+    assert_eq!(
+        settings["ai_enabled"], false,
+        "Windows must not opt in to Gemini just because macOS enabled OpenAI"
+    );
+    let result = app.call(json!({"action":"ai_result","id":1,"revision":job["revision"],"provider":job["provider"],"model":job["model"],"tags":job["tags"],"response":openai_response(r#"{"title":"登入測試","category":"其他"}"#)}));
+    assert_eq!(result["applied"], true);
+    assert_eq!(result["board"]["notes"][0]["title"], "登入測試");
+    assert_eq!(result["board"]["notes"][0]["original"], "測試登入");
+}
+
+#[test]
+fn switched_provider_rejects_old_result_even_if_the_model_name_matches() {
+    let app = Fixture::new();
+    app.call(
+        json!({"action":"preferences","provider":"openai","ai_enabled":true,"model":"same-model"}),
+    );
+    app.call(json!({"action":"capture","text":"測試登入"}));
+    let job = app.call(json!({"action":"ai_job","id":1}))["job"].clone();
+    app.call(
+        json!({"action":"preferences","provider":"gemini","ai_enabled":true,"model":"same-model"}),
+    );
+    let result = app.call(json!({"action":"ai_result","id":1,"revision":job["revision"],"provider":job["provider"],"model":"same-model","tags":job["tags"],"response":openai_response(r#"{"title":"不應採用","category":"其他"}"#)}));
+    assert_eq!(result["applied"], false);
+    assert_eq!(result["board"]["notes"][0]["title"], "測試登入");
+}
+
+#[test]
+fn cloud_connection_check_sends_sample_and_only_generic_labels() {
+    let app = Fixture::new();
+    app.call(json!({"action":"tag","label":"私人專案"}));
+    app.call(json!({"action":"capture","text":"不出現在測試的文字"}));
+    let job =
+        app.call(json!({"action":"ai_job","provider":"openai","model":"gpt-test"}))["job"].clone();
+    assert_eq!(job["model"], "gpt-test");
+    assert_eq!(job["tags"], json!([["其他", "其他"]]));
+    assert!(!job.to_string().contains("私人專案"));
+    assert!(!job.to_string().contains("不出現在測試的文字"));
+    assert_eq!(app.call(json!({"action":"ai_check","provider":"openai","tags":job["tags"],"response":openai_response(r#"{"title":"測試","category":"其他"}"#)}))["ok"], true);
+    assert_eq!(
+        app.call(json!({"action":"load"}))["board"]["settings"]["ai_enabled"],
+        false
+    );
+}
+
 mod tempfile_like {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};

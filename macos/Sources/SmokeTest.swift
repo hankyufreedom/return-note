@@ -49,7 +49,20 @@ func runSmokeTest() -> Int32 {
         try check(BoardModel(core: fresh.core).visible.map(\.id) == [2, 3], "reorder persists")
         let content = try Data(contentsOf: dir.appendingPathComponent("notes.json"))
         try check((try? JSONDecoder().decode(Board.self, from: content)) != nil, "Windows-compatible board file")
-        print("macOS smoke test passed: capture, draft, taxonomy, edit, search, timer, reminder, completion, reorder, persistence")
+        try check(model.settings?.cloudEnabled == false, "cloud AI defaults to off")
+        let gemini = try JSONDecoder().decode(AIJobEnvelope.self, from: fresh.core.raw("ai_job", ["provider": "gemini"])).job
+        let openai = try JSONDecoder().decode(AIJobEnvelope.self, from: fresh.core.raw("ai_job", ["provider": "openai", "model": "gpt-test"])).job
+        let dummy = "smoke-test-only"
+        let googleRequest = try AIClient.request(job: gemini, key: dummy)
+        let openaiRequest = try AIClient.request(job: openai, key: dummy)
+        try check(googleRequest.url?.host == "generativelanguage.googleapis.com" && googleRequest.value(forHTTPHeaderField: "x-goog-api-key") == dummy && googleRequest.value(forHTTPHeaderField: "Authorization") == nil, "Gemini endpoint and auth")
+        try check(openaiRequest.url?.absoluteString == "https://api.openai.com/v1/responses" && openaiRequest.value(forHTTPHeaderField: "Authorization") == "Bearer \(dummy)" && openaiRequest.value(forHTTPHeaderField: "x-goog-api-key") == nil, "OpenAI endpoint and auth")
+        try check((try? AIClient.request(job: openai, key: "bad\nkey")) == nil, "reject malformed unsaved key before creating a request")
+        try check(BoardModel(core: fresh.core).settings?.provider == .gemini, "testing a provider does not select it")
+        fresh.perform("preferences", ["provider": "openai", "model": "gpt-test", "ai_enabled": true])
+        let updated = BoardModel(core: fresh.core).settings
+        try check(updated?.provider == .openai && updated?.cloudEnabled == true && updated?.modelName(for: .openai) == "gpt-test" && updated?.ai_enabled == false, "reopen OpenAI preferences independently of Gemini")
+        print("macOS smoke test passed: capture, draft, taxonomy, edit, search, timer, reminder, completion, reorder, persistence, AI settings and request routing (offline)")
         return 0
     } catch {
         fputs(error.localizedDescription + "\n", stderr)

@@ -213,7 +213,9 @@ struct BoardView: View {
                 Button(note.remind_at == nil && !note.reminder_due ? "10 分鐘後回看" : "清除回看提醒") {
                     model.perform("reminder", ["id": note.id, "enabled": note.remind_at == nil && !note.reminder_due])
                 }.disabled(note.status == .done)
-                if model.settings?.ai_enabled == true && note.status != .done { Button("用 Gemini 重新分類") { model.classify(note.id) } }
+                if let settings = model.settings, settings.cloudEnabled && note.status != .done {
+                    Button("用 \(settings.provider.title) 重新分類") { model.classify(note.id) }
+                }
                 Divider()
                 Button("上移") { model.nudge(note.id, down: false) }.disabled(model.visible.first?.id == note.id)
                 Button("下移") { model.nudge(note.id, down: true) }.disabled(model.visible.last?.id == note.id)

@@ -1,7 +1,7 @@
 //! JSON command boundary for the native macOS frontend. The caller serializes writes.
 use crate::{
     ai,
-    model::{Board, MAX_TEXT, Status, now},
+    model::{AiProvider, Board, MAX_TEXT, Settings, Status, now},
     storage::Storage,
 };
 use serde::Deserialize;
@@ -59,22 +59,31 @@ enum Command {
         zoom_percent: Option<u16>,
         ai_enabled: Option<bool>,
         model: Option<String>,
+        provider: Option<AiProvider>,
     },
     AiJob {
         id: Option<u64>,
+        provider: Option<AiProvider>,
+        model: Option<String>,
     },
     AiResult {
         id: u64,
         revision: u64,
+        #[serde(default)]
+        provider: AiProvider,
         model: String,
         tags: Vec<(String, String)>,
         response: Value,
     },
     AiError {
+        #[serde(default)]
+        provider: AiProvider,
         status: u32,
         response: Value,
     },
     AiCheck {
+        #[serde(default)]
+        provider: AiProvider,
         response: Value,
         tags: Vec<(String, String)>,
     },
@@ -89,12 +98,51 @@ fn tags(board: &Board) -> Vec<(String, String)> {
         .collect()
 }
 
-fn execute(folder: &str, command: Command) -> Result<Value, String> {
-    if let Command::AiError { status, response } = command {
-        return Err(ai::service_error(status, &response));
+fn ai_model(s: &Settings, provider: AiProvider) -> &str {
+    match provider {
+        AiProvider::Gemini => &s.model,
+        AiProvider::OpenAi => &s.openai_model,
     }
-    if let Command::AiCheck { response, tags } = command {
-        ai::parse_with_labels(
+}
+
+fn ai_enabled(s: &Settings) -> bool {
+    match s.ai_provider {
+        AiProvider::Gemini => s.ai_enabled,
+        AiProvider::OpenAi => s.openai_enabled,
+    }
+}
+
+fn parse_ai(
+    provider: AiProvider,
+    response: &Value,
+    labels: &[String],
+) -> Result<ai::Classification, String> {
+    match provider {
+        AiProvider::Gemini => ai::parse_with_labels(response, labels),
+        AiProvider::OpenAi => ai::openai::parse(response, labels),
+    }
+}
+
+fn execute(folder: &str, command: Command) -> Result<Value, String> {
+    if let Command::AiError {
+        provider,
+        status,
+        response,
+    } = command
+    {
+        return Err(match provider {
+            AiProvider::Gemini => ai::service_error(status, &response),
+            AiProvider::OpenAi => ai::openai::error(status, &response),
+        });
+    }
+    if let Command::AiCheck {
+        provider,
+        response,
+        tags,
+    } = command
+    {
+        parse_ai(
+            provider,
             &response,
             &tags.into_iter().map(|(_, label)| label).collect::<Vec<_>>(),
         )?;
@@ -160,6 +208,7 @@ fn execute(folder: &str, command: Command) -> Result<Value, String> {
             zoom_percent,
             ai_enabled,
             model,
+            provider,
         } => {
             let s = &mut board.settings;
             if let Some(v) = topmost {
@@ -174,30 +223,55 @@ fn execute(folder: &str, command: Command) -> Result<Value, String> {
                 }
                 s.zoom_percent = v;
             }
-            if let Some(v) = ai_enabled {
-                s.ai_enabled = v;
-            }
+            let selected = provider.unwrap_or(s.ai_provider);
             if let Some(v) = model {
                 if !ai::valid_model(&v) {
-                    return Err("Gemini 模型名稱格式不正確。".into());
+                    return Err("模型名稱格式不正確。".into());
                 }
-                s.model = v;
+                match selected {
+                    AiProvider::Gemini => s.model = v,
+                    AiProvider::OpenAi => s.openai_model = v,
+                }
             }
+            // Older Windows builds only read `ai_enabled`, which always refers to Gemini.
+            let enable =
+                ai_enabled.unwrap_or_else(|| selected == s.ai_provider && self::ai_enabled(s));
+            s.ai_provider = selected;
+            s.ai_enabled = selected == AiProvider::Gemini && enable;
+            s.openai_enabled = selected == AiProvider::OpenAi && enable;
         }
-        Command::AiJob { id } => {
-            let model = &board.settings.model;
+        Command::AiJob {
+            id,
+            provider,
+            model,
+        } => {
+            let s = &board.settings;
+            let provider = if id.is_some() {
+                s.ai_provider
+            } else {
+                provider.unwrap_or(s.ai_provider)
+            };
+            let model = if id.is_some() {
+                ai_model(s, provider)
+            } else {
+                model.as_deref().unwrap_or_else(|| ai_model(s, provider))
+            };
             if !ai::valid_model(model) {
-                return Err("Gemini 模型名稱格式不正確。".into());
+                return Err("模型名稱格式不正確。".into());
             }
-            let tagged = tags(&board);
+            let tagged = if id.is_some() {
+                tags(&board)
+            } else {
+                vec![("其他".into(), "其他".into())]
+            };
             let labels = tagged
                 .iter()
                 .map(|(_, label)| label.clone())
                 .collect::<Vec<_>>();
             let (text, revision) = match id {
                 Some(id) => {
-                    if !board.settings.ai_enabled {
-                        return Err("Gemini 分類未開啟。".into());
+                    if !ai_enabled(s) {
+                        return Err("AI 分類未開啟。".into());
                     }
                     let note = board
                         .notes
@@ -211,24 +285,34 @@ fn execute(folder: &str, command: Command) -> Result<Value, String> {
                 }
                 None => ("測試連線：整理今天的工作", 0),
             };
+            let body = match provider {
+                AiProvider::Gemini => ai::request_body(text, &labels),
+                AiProvider::OpenAi => ai::openai::request(model, text, &labels),
+            };
             return Ok(
-                json!({"job": {"model":model,"tags":tagged,"revision":revision,"body":ai::request_body(text, &labels)}}),
+                json!({"job": {"provider":provider,"model":model,"tags":tagged,"revision":revision,"body":body}}),
             );
         }
         Command::AiResult {
             id,
             revision,
+            provider,
             model,
             tags: sent,
             response: data,
         } => {
             save = false;
-            if board.settings.ai_enabled && model == board.settings.model && sent == tags(&board) {
+            let s = &board.settings;
+            if ai_enabled(s)
+                && provider == s.ai_provider
+                && model == ai_model(s, provider)
+                && sent == tags(&board)
+            {
                 let labels = sent
                     .iter()
                     .map(|(_, label)| label.clone())
                     .collect::<Vec<_>>();
-                let result = ai::parse_with_labels(&data, &labels)?;
+                let result = parse_ai(provider, &data, &labels)?;
                 let (key, _) = sent
                     .iter()
                     .find(|(_, label)| label == &result.category)

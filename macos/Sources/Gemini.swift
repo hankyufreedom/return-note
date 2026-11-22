@@ -1,39 +1,55 @@
 import Foundation
 import Security
 
-enum GeminiKey {
-    private static let identity: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: "io.github.wsxqaza12.return-note.gemini", kSecAttrAccount as String: "Gemini API key"]
+enum AIProvider: String, Codable, CaseIterable, Identifiable {
+    case gemini, openai
+    var id: String { rawValue }
+    var title: String { self == .gemini ? "Google Gemini" : "OpenAI（GPT）" }
+    var defaultModel: String { self == .gemini ? "gemini-3.1-flash-lite" : "gpt-5-mini" }
+}
 
-    static func read() throws -> String? {
-        var query = identity
+enum AIKey {
+    private static func identity(_ provider: AIProvider) -> [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword,
+         kSecAttrService as String: "io.github.wsxqaza12.return-note.\(provider.rawValue)",
+         kSecAttrAccount as String: provider == .gemini ? "Gemini API key" : "OpenAI API key"]
+    }
+
+    static func read(_ provider: AIProvider) throws -> String? {
+        var query = identity(provider)
         query[kSecReturnData as String] = true
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         if status == errSecItemNotFound { return nil }
         guard status == errSecSuccess, let data = item as? Data, let key = String(data: data, encoding: .utf8) else {
-            throw NoteError("無法讀取鑰匙圈的 Gemini API key。")
+            throw NoteError("無法讀取鑰匙圈的 \(provider.title) API key。")
         }
         return key
     }
 
-    static func save(_ key: String) throws {
+    static func validate(_ key: String) throws {
         guard !key.isEmpty, key.utf8.count <= 512,
-              key.utf8.allSatisfy({ $0 >= 33 && $0 <= 126 }) else { throw NoteError("Gemini API key 格式不正確。") }
+              key.utf8.allSatisfy({ $0 >= 33 && $0 <= 126 }) else { throw NoteError("API key 格式不正確。") }
+    }
+
+    static func save(_ key: String, for provider: AIProvider) throws {
+        try validate(key)
+        let identity = identity(provider)
         let values = [kSecValueData as String: Data(key.utf8)]
         var status = SecItemUpdate(identity as CFDictionary, values as CFDictionary)
         if status == errSecItemNotFound { status = SecItemAdd(identity.merging(values) { _, new in new } as CFDictionary, nil) }
-        guard status == errSecSuccess else { throw NoteError("無法儲存 Gemini API key 到鑰匙圈。") }
+        guard status == errSecSuccess else { throw NoteError("無法儲存 API key 到鑰匙圈。") }
     }
 
-    static func remove() throws {
-        let status = SecItemDelete(identity as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else { throw NoteError("無法從鑰匙圈移除 Gemini API key。") }
+    static func remove(_ provider: AIProvider) throws {
+        let status = SecItemDelete(identity(provider) as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else { throw NoteError("無法從鑰匙圈移除 API key。") }
     }
 }
 
-struct GeminiJobEnvelope: Decodable { let job: GeminiJob }
-struct GeminiJob: Decodable {
+struct AIJobEnvelope: Decodable { let job: AIJob }
+struct AIJob: Decodable {
+    let provider: AIProvider
     let model: String
     let tags: [[String]]
     let revision: UInt64
@@ -73,7 +89,7 @@ private final class NoRedirect: NSObject, URLSessionTaskDelegate {
     }
 }
 
-final class Gemini {
+final class AIClient {
     private let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 15
@@ -84,19 +100,29 @@ final class Gemini {
     }()
     deinit { session.invalidateAndCancel() }
 
-    func send(job: GeminiJob, key: String, completion: @escaping (Result<(Int, Any), Error>) -> Void) throws -> URLSessionDataTask {
-        guard job.model.range(of: "^[A-Za-z0-9.-]{1,100}$", options: .regularExpression) != nil,
-              let endpoint = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(job.model):generateContent") else {
-            throw NoteError("Gemini 模型名稱格式不正確。")
-        }
+    static func request(job: AIJob, key: String) throws -> URLRequest {
+        try AIKey.validate(key)
+        guard job.model.range(of: #"\A[A-Za-z0-9.-]{1,100}\z"#, options: .regularExpression) != nil else { throw NoteError("模型名稱格式不正確。") }
+        let endpoint = job.provider == .gemini
+            ? "https://generativelanguage.googleapis.com/v1beta/models/\(job.model):generateContent"
+            : "https://api.openai.com/v1/responses"
+        guard let endpoint = URL(string: endpoint) else { throw NoteError("無法建立 API 請求。") }
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(key, forHTTPHeaderField: "x-goog-api-key")
+        switch job.provider {
+        case .gemini: request.setValue(key, forHTTPHeaderField: "x-goog-api-key")
+        case .openai: request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        }
         request.httpBody = try JSONEncoder().encode(job.body)
+        return request
+    }
+
+    func send(job: AIJob, key: String, completion: @escaping (Result<(Int, Any), Error>) -> Void) throws -> URLSessionDataTask {
+        let request = try Self.request(job: job, key: key)
         let task = session.dataTask(with: request) { data, response, error in
             guard error == nil, let http = response as? HTTPURLResponse, let data, data.count <= 2_000_000 else {
-                completion(.failure(NoteError("Gemini 連線失敗或回應逾時；便條仍保留在本機。"))); return
+                completion(.failure(NoteError("\(job.provider.title) 連線失敗或回應逾時；便條仍保留在本機。"))); return
             }
             let value = (try? JSONSerialization.jsonObject(with: data)) ?? NSNull()
             completion(.success((http.statusCode, value)))
